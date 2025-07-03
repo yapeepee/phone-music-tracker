@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies including dev tools
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    ffmpeg \
+    git \
+    curl \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+COPY requirements-dev.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements-dev.txt
+RUN pip install watchdog[watchmedo]
+
+# Copy application code
+COPY . .
+
+# Keep container running for development
+EXPOSE 8000
