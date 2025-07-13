@@ -45,6 +45,8 @@ async def create_session(
         "self_rating": session.self_rating,
         "note": session.note,
         "tags": [tag.name for tag in session.tags],
+        "target_tempo": session.target_tempo,
+        "practice_mode": session.practice_mode,
         "is_synced": session.is_synced,
         "created_at": session.created_at,
         "updated_at": session.updated_at,

@@ -10,6 +10,7 @@ sqlalchemy==2.0.23
 alembic==1.12.1
 asyncpg==0.29.0
 psycopg2-binary==2.9.9
+greenlet==3.0.3
 
 # Cache & Queue
 redis==5.0.1
@@ -36,6 +37,9 @@ httpx==0.25.2
 python-dateutil==2.8.2
 pydantic-extra-types==2.2.0
 email-validator==2.1.0
+bleach==6.1.0
+markdown==3.5.1
+slowapi==0.1.9
 
 # Dev
 pytest==7.4.3

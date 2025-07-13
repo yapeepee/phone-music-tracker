@@ -3,15 +3,17 @@ from typing import Optional, List, Tuple
 from uuid import UUID
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, func, update, desc
+from sqlalchemy import select, and_, or_, func, update, desc, insert
 from sqlalchemy.orm import selectinload, joinedload
 
-from app.models.forum import Post, Comment, PostVote, CommentVote, PostStatus, VoteType
+from app.models.forum import Post, Comment, PostVote, CommentVote, PostStatus, VoteType, post_tags
 from app.models.forum_media import ForumMedia
 from app.models.user import User
 from app.models.practice import Tag
 from app.schemas.forum import PostCreate, PostUpdate, CommentCreate, CommentUpdate, VoteCreate
 from app.services.community.reputation_service import ReputationService
+from app.utils.sanitization import sanitize_markdown
+# from app.core.cache import cache_get, cache_set, cache_delete, CacheKeys, invalidate_forum_cache  # Temporarily disabled
 
 
 class ForumService:
@@ -25,21 +27,26 @@ class ForumService:
         post_data: PostCreate
     ) -> Post:
         """Create a new forum post."""
+        # Sanitize user input to prevent XSS
+        sanitized_title = sanitize_markdown(post_data.title, allow_images=False)
+        sanitized_content = sanitize_markdown(post_data.content, allow_images=True)
+        
         # Create the post
         db_post = Post(
             author_id=author_id,
-            title=post_data.title,
-            content=post_data.content,
+            title=sanitized_title,
+            content=sanitized_content,
             status=PostStatus.PUBLISHED,
             related_piece_id=post_data.related_piece_id
         )
         
         self.db.add(db_post)
-        await self.db.flush()  # Flush to get the post ID
+        await self.db.commit()  # Commit first to avoid lazy loading issues
         
         # Handle tags if provided
         if post_data.tags:
-            # Get or create tags
+            # Get or create tags and collect their IDs
+            tag_ids = []
             for tag_name in post_data.tags:
                 # First check if tag exists
                 tag_query = select(Tag).where(Tag.name == tag_name)
@@ -50,15 +57,24 @@ class ForumService:
                     # Create global tag (no owner)
                     tag = Tag(name=tag_name)
                     self.db.add(tag)
+                    await self.db.flush()  # Flush to get tag ID
                 
-                # Associate tag with post
-                db_post.tags.append(tag)
+                tag_ids.append(tag.id)
+            
+            # Insert associations directly into the junction table
+            if tag_ids:
+                await self.db.execute(
+                    insert(post_tags).values([
+                        {"post_id": db_post.id, "tag_id": tag_id}
+                        for tag_id in tag_ids
+                    ])
+                )
+            
+            # Commit tag associations
+            await self.db.commit()
         
-        await self.db.commit()
-        await self.db.refresh(db_post)
-        
-        # Load author info
-        await self.db.refresh(db_post, ['author', 'tags'])
+        # Load all relationships needed by the endpoint
+        await self.db.refresh(db_post, ['author', 'tags', 'related_piece'])
         
         # Check if this is the user's first post today for reputation bonus
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -161,6 +177,17 @@ class ForumService:
         increment_views: bool = True
     ) -> Optional[Post]:
         """Get a single post by ID."""
+        # Try to get from cache if not incrementing views
+        # Temporarily disabled cache operations
+        # cache_key = CacheKeys.format(CacheKeys.FORUM_POST, post_id=str(post_id))
+        # 
+        # if not increment_views:
+        #     cached_post = await cache_get(cache_key)
+        #     if cached_post:
+        #         # Reconstruct Post object from cached data
+        #         # For now, skip cache reconstruction complexity
+        #         pass
+        
         query = select(Post).where(Post.id == post_id).options(
             selectinload(Post.author),
             selectinload(Post.tags),
@@ -168,7 +195,11 @@ class ForumService:
             selectinload(Post.related_piece),
             selectinload(Post.comments).options(
                 selectinload(Comment.author),
-                selectinload(Comment.media_files)
+                selectinload(Comment.media_files),
+                selectinload(Comment.children).options(
+                    selectinload(Comment.author),
+                    selectinload(Comment.children)  # Load nested children
+                )
             ),
             selectinload(Post.accepted_answer)
         )
@@ -185,6 +216,14 @@ class ForumService:
             )
             await self.db.commit()
             post.view_count += 1
+            
+            # Invalidate cache when view count changes
+            # Temporarily disabled - await cache_delete(cache_key)
+            pass
+        elif post and not increment_views:
+            # Cache the post for 5 minutes when not incrementing views
+            # Note: Complex object caching would need proper serialization
+            pass
         
         return post
     
@@ -201,12 +240,12 @@ class ForumService:
         if not post or post.author_id != author_id:
             return None
         
-        # Update fields
+        # Update fields with sanitization
         if post_update.title is not None:
-            post.title = post_update.title
+            post.title = sanitize_markdown(post_update.title, allow_images=False)
         
         if post_update.content is not None:
-            post.content = post_update.content
+            post.content = sanitize_markdown(post_update.content, allow_images=True)
         
         if post_update.status is not None:
             post.status = post_update.status
@@ -280,12 +319,12 @@ class ForumService:
             if not parent:
                 raise ValueError("Parent comment not found")
         
-        # Create comment
+        # Create comment with sanitized content
         db_comment = Comment(
             post_id=post_id,
             author_id=author_id,
             parent_id=comment_data.parent_id,
-            content=comment_data.content
+            content=sanitize_markdown(comment_data.content, allow_images=True)
         )
         
         self.db.add(db_comment)
@@ -353,7 +392,7 @@ class ForumService:
         if not comment:
             return None
         
-        comment.content = comment_update.content
+        comment.content = sanitize_markdown(comment_update.content, allow_images=True)
         comment.updated_at = datetime.now(timezone.utc)
         
         self.db.add(comment)

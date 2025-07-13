@@ -1,19 +1,20 @@
 from typing import List, Annotated, Optional
 from uuid import UUID
-from datetime import datetime, timezone as tz
+from datetime import datetime, timezone as tz, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, text
 from sqlalchemy.orm import selectinload, joinedload
 
 from app.api import deps
-from app.models.user import User
-from app.models.practice import Tag, user_current_pieces
+from app.models.user import User as UserModel
+from app.models.practice import Tag as TagModel, user_current_pieces
 from app.models.practice_partner import (
     UserAvailability, UserPracticePreferences, 
     PracticePartnerMatch, PartnerPracticeSession,
     MatchStatus
 )
+from app.services.notification_service import NotificationService
 from app.schemas.practice_partner import (
     UserAvailability as UserAvailabilitySchema,
     UserAvailabilityCreate,
@@ -180,93 +181,98 @@ async def discover_practice_partners(
     limit: int = Query(20, ge=1, le=100),
 ) -> List[CompatiblePartner]:
     """Discover compatible practice partners based on filters."""
-    # Base query to find users working on the same pieces
-    query = text("""
-        WITH user_pieces AS (
-            SELECT 
-                ucp.user_id,
-                ucp.piece_id,
-                u.full_name,
-                u.timezone as user_timezone,
-                upp.skill_level,
-                upp.languages,
-                upp.preferred_communication,
-                t.name as piece_name,
-                t.composer
-            FROM user_current_pieces ucp
-            JOIN users u ON u.id = ucp.user_id
-            LEFT JOIN user_practice_preferences upp ON upp.user_id = u.id
-            JOIN tags t ON t.id = ucp.piece_id
-            WHERE (upp.is_available_for_partners = true OR upp.is_available_for_partners IS NULL)
-              AND u.is_active = true
-              AND u.id != :current_user_id
-              AND t.is_archived = false
-        ),
-        compatible_partners AS (
-            SELECT 
-                up.user_id,
-                up.full_name,
-                up.user_timezone,
-                up.piece_id,
-                up.piece_name,
-                up.composer,
-                up.skill_level,
-                up.languages,
-                up.preferred_communication,
-                -- For now, set timezone difference to 0 (we'll implement proper timezone calculation later)
-                0 as timezone_diff_hours
-            FROM user_pieces up
-            WHERE (CAST(:piece_id AS UUID) IS NULL OR up.piece_id = CAST(:piece_id AS UUID))
-              AND (CAST(:skill_level AS TEXT) IS NULL OR up.skill_level = CAST(:skill_level AS TEXT))
-              AND (CAST(:language AS TEXT) IS NULL OR CAST(:language AS TEXT) = ANY(up.languages))
-              -- Exclude existing matches
-              AND NOT EXISTS (
-                  SELECT 1 FROM practice_partner_matches ppm
-                  WHERE ((ppm.requester_id = :current_user_id AND ppm.partner_id = up.user_id)
-                     OR (ppm.requester_id = up.user_id AND ppm.partner_id = :current_user_id))
-                    AND ppm.piece_id = up.piece_id
-                    AND ppm.status IN ('pending', 'accepted')
-              )
-        )
-        SELECT 
-            user_id,
-            full_name,
-            user_timezone as timezone,
-            timezone_diff_hours,
-            skill_level,
-            COALESCE(languages, ARRAY[]::text[]) as common_languages,
-            piece_id,
-            piece_name,
-            composer as piece_composer
-        FROM compatible_partners
-        WHERE (CAST(:max_timezone_diff AS INTEGER) IS NULL OR timezone_diff_hours <= CAST(:max_timezone_diff AS INTEGER))
-        ORDER BY timezone_diff_hours, full_name
-        OFFSET :skip
-        LIMIT :limit
-    """)
+    # Build base query using SQLAlchemy ORM
+    from sqlalchemy import exists
     
-    result = await db.execute(
-        query,
-        {
-            "current_user_id": current_user.id,
-            "piece_id": filters.piece_id,
-            "skill_level": filters.skill_level.value if filters.skill_level else None,
-            "language": filters.language,
-            "max_timezone_diff": filters.max_timezone_diff_hours,
-            "skip": skip,
-            "limit": limit
-        }
+    # Start with user_current_pieces join
+    query = (
+        select(
+            UserModel.id.label("user_id"),
+            UserModel.full_name,
+            UserModel.timezone,
+            TagModel.id.label("piece_id"),
+            TagModel.name.label("piece_name"),
+            TagModel.composer.label("piece_composer"),
+            UserPracticePreferences.skill_level,
+            UserPracticePreferences.languages,
+            UserPracticePreferences.preferred_communication
+        )
+        .select_from(user_current_pieces)
+        .join(UserModel, UserModel.id == user_current_pieces.c.user_id)
+        .join(TagModel, TagModel.id == user_current_pieces.c.piece_id)
+        .outerjoin(UserPracticePreferences, UserPracticePreferences.user_id == UserModel.id)
+        .where(
+            # User must be active and not the current user
+            UserModel.is_active == True,
+            UserModel.id != current_user.id,
+            # Piece must not be archived
+            TagModel.is_archived == False,
+            # User must be available for partners (or no preference set)
+            or_(
+                UserPracticePreferences.is_available_for_partners == True,
+                UserPracticePreferences.is_available_for_partners == None
+            )
+        )
     )
     
+    # Apply filters
+    if filters.piece_id:
+        query = query.where(TagModel.id == filters.piece_id)
+    
+    if filters.skill_level:
+        query = query.where(UserPracticePreferences.skill_level == filters.skill_level.value)
+    
+    if filters.language:
+        # Using func.any() for array contains check
+        query = query.where(
+            func.array_position(UserPracticePreferences.languages, filters.language) != None
+        )
+    
+    # Exclude existing matches
+    existing_match_subquery = (
+        exists()
+        .where(
+            or_(
+                and_(
+                    PracticePartnerMatch.requester_id == current_user.id,
+                    PracticePartnerMatch.partner_id == UserModel.id
+                ),
+                and_(
+                    PracticePartnerMatch.requester_id == UserModel.id,
+                    PracticePartnerMatch.partner_id == current_user.id
+                )
+            ),
+            PracticePartnerMatch.piece_id == TagModel.id,
+            PracticePartnerMatch.status.in_([MatchStatus.PENDING.value, MatchStatus.ACCEPTED.value])
+        )
+    )
+    query = query.where(~existing_match_subquery)
+    
+    # Apply ordering and pagination
+    query = query.order_by(UserModel.full_name).offset(skip).limit(limit)
+    
+    # Execute query
+    result = await db.execute(query)
+    rows = result.all()
+    
+    # Convert to response model
     partners = []
-    for row in result:
+    for row in rows:
+        # Calculate timezone difference (simplified for now)
+        # TODO: Implement proper timezone calculation
+        timezone_diff_hours = 0
+        
+        # Skip if timezone difference filter is applied and exceeds limit
+        if filters.max_timezone_diff_hours is not None and timezone_diff_hours > filters.max_timezone_diff_hours:
+            continue
+        
         partners.append(CompatiblePartner(
             user_id=row.user_id,
             full_name=row.full_name,
-            timezone=row.timezone,
-            timezone_diff_hours=int(row.timezone_diff_hours),
+            timezone=row.timezone or "UTC",
+            timezone_diff_hours=timezone_diff_hours,
             skill_level=row.skill_level,
-            common_languages=row.common_languages or [],
+            common_languages=row.languages or [],
             piece_id=row.piece_id,
             piece_name=row.piece_name,
             piece_composer=row.piece_composer
@@ -344,12 +350,12 @@ async def create_practice_partner_request(
     """Send a practice partner request."""
     # Validate partner exists and is available
     partner_query = (
-        select(User)
+        select(UserModel)
         .join(UserPracticePreferences)
         .where(
             and_(
-                User.id == request.partner_id,
-                User.is_active == True,
+                UserModel.id == request.partner_id,
+                UserModel.is_active == True,
                 UserPracticePreferences.is_available_for_partners == True
             )
         )
@@ -412,7 +418,20 @@ async def create_practice_partner_request(
     await db.commit()
     await db.refresh(db_match)
     
-    # TODO: Send notification to partner
+    # Get piece information for notification
+    piece_query = select(TagModel).where(TagModel.id == request.piece_id)
+    piece_result = await db.execute(piece_query)
+    piece = piece_result.scalar_one()
+    
+    # Send notification to partner
+    notification_service = NotificationService(db)
+    await notification_service.create_partner_request_notification(
+        partner_id=request.partner_id,
+        requester_name=current_user.full_name,
+        piece_name=piece.name,
+        match_id=db_match.id,
+        message=request.requester_message
+    )
     
     return db_match
 
@@ -465,7 +484,40 @@ async def update_practice_partner_match(
     await db.commit()
     await db.refresh(match)
     
-    # TODO: Send notification to other user
+    # Send notifications based on status change
+    if update.status:
+        # Get piece and user information
+        piece_query = select(TagModel).where(TagModel.id == match.piece_id)
+        piece_result = await db.execute(piece_query)
+        piece = piece_result.scalar_one()
+        
+        notification_service = NotificationService(db)
+        
+        if update.status == MatchStatus.ACCEPTED:
+            # Get partner name (the person accepting)
+            partner_query = select(UserModel).where(UserModel.id == match.partner_id)
+            partner_result = await db.execute(partner_query)
+            partner = partner_result.scalar_one()
+            
+            await notification_service.create_partner_accepted_notification(
+                requester_id=match.requester_id,
+                partner_name=partner.full_name,
+                piece_name=piece.name,
+                match_id=match.id,
+                message=update.partner_message
+            )
+        elif update.status == MatchStatus.DECLINED:
+            # Get partner name (the person declining)
+            partner_query = select(UserModel).where(UserModel.id == match.partner_id)
+            partner_result = await db.execute(partner_query)
+            partner = partner_result.scalar_one()
+            
+            await notification_service.create_partner_declined_notification(
+                requester_id=match.requester_id,
+                partner_name=partner.full_name,
+                piece_name=piece.name,
+                match_id=match.id
+            )
     
     return match
 
@@ -476,7 +528,10 @@ async def get_compatible_practice_times(
     db: Annotated[AsyncSession, Depends(deps.get_db)],
     current_user: Annotated[User, Depends(deps.get_current_active_user)],
 ) -> List[dict]:
-    """Find compatible practice times between matched partners."""
+    """Find compatible practice times between matched partners with timezone conversion."""
+    from datetime import datetime, date, time
+    import pytz
+    
     # Get the match
     query = select(PracticePartnerMatch).where(
         and_(
@@ -494,9 +549,17 @@ async def get_compatible_practice_times(
     if not match:
         raise HTTPException(status_code=404, detail="Match not found or not accepted")
     
-    # Get availability for both users
+    # Get both users with their timezone info
     partner_id = match.partner_id if match.requester_id == current_user.id else match.requester_id
     
+    # Get user timezones
+    users_query = select(UserModel.id, UserModel.timezone).where(
+        UserModel.id.in_([current_user.id, partner_id])
+    )
+    users_result = await db.execute(users_query)
+    user_timezones = {row[0]: row[1] for row in users_result}
+    
+    # Get availability for both users
     availability_query = select(UserAvailability).where(
         and_(
             UserAvailability.user_id.in_([current_user.id, partner_id]),
@@ -514,30 +577,71 @@ async def get_compatible_practice_times(
             user_availability[slot.user_id] = []
         user_availability[slot.user_id].append(slot)
     
-    # Find overlapping times (simplified - assumes same timezone for now)
-    # TODO: Implement proper timezone conversion
     compatible_times = []
     
     if len(user_availability) == 2:
+        # Get a reference date (next Monday) to work with actual datetimes
+        today = date.today()
+        days_until_monday = (7 - today.weekday()) % 7
+        if days_until_monday == 0:
+            days_until_monday = 7
+        next_monday = today + timedelta(days=days_until_monday)
+        
         user1_slots = user_availability[current_user.id]
         user2_slots = user_availability[partner_id]
         
+        # Get timezones
+        user1_tz = pytz.timezone(user_timezones.get(current_user.id, 'UTC'))
+        user2_tz = pytz.timezone(user_timezones.get(partner_id, 'UTC'))
+        
         for slot1 in user1_slots:
             for slot2 in user2_slots:
-                if slot1.day_of_week == slot2.day_of_week:
-                    # Check for time overlap
-                    overlap_start = max(slot1.start_time, slot2.start_time)
-                    overlap_end = min(slot1.end_time, slot2.end_time)
+                # Convert availability to actual datetimes for the week
+                slot1_date = next_monday + timedelta(days=slot1.day_of_week)
+                slot2_date = next_monday + timedelta(days=slot2.day_of_week)
+                
+                # Create timezone-aware datetimes
+                slot1_start = user1_tz.localize(datetime.combine(slot1_date, slot1.start_time))
+                slot1_end = user1_tz.localize(datetime.combine(slot1_date, slot1.end_time))
+                slot2_start = user2_tz.localize(datetime.combine(slot2_date, slot2.start_time))
+                slot2_end = user2_tz.localize(datetime.combine(slot2_date, slot2.end_time))
+                
+                # Convert to UTC for comparison
+                slot1_start_utc = slot1_start.astimezone(pytz.UTC)
+                slot1_end_utc = slot1_end.astimezone(pytz.UTC)
+                slot2_start_utc = slot2_start.astimezone(pytz.UTC)
+                slot2_end_utc = slot2_end.astimezone(pytz.UTC)
+                
+                # Check for overlap in UTC
+                overlap_start_utc = max(slot1_start_utc, slot2_start_utc)
+                overlap_end_utc = min(slot1_end_utc, slot2_end_utc)
+                
+                if overlap_start_utc < overlap_end_utc:
+                    # Convert back to both users' local times
+                    overlap_start_user1 = overlap_start_utc.astimezone(user1_tz)
+                    overlap_end_user1 = overlap_end_utc.astimezone(user1_tz)
+                    overlap_start_user2 = overlap_start_utc.astimezone(user2_tz)
+                    overlap_end_user2 = overlap_end_utc.astimezone(user2_tz)
                     
-                    if overlap_start < overlap_end:
-                        compatible_times.append({
-                            "day_of_week": slot1.day_of_week,
-                            "start_time": overlap_start.isoformat(),
-                            "end_time": overlap_end.isoformat(),
-                            "duration_minutes": (
-                                (overlap_end.hour * 60 + overlap_end.minute) -
-                                (overlap_start.hour * 60 + overlap_start.minute)
-                            )
-                        })
+                    duration_minutes = int((overlap_end_utc - overlap_start_utc).total_seconds() / 60)
+                    
+                    compatible_times.append({
+                        "day_of_week": overlap_start_user1.weekday(),
+                        "start_time_utc": overlap_start_utc.isoformat(),
+                        "end_time_utc": overlap_end_utc.isoformat(),
+                        "current_user_time": {
+                            "timezone": user_timezones.get(current_user.id),
+                            "day": overlap_start_user1.strftime("%A"),
+                            "start_time": overlap_start_user1.strftime("%I:%M %p"),
+                            "end_time": overlap_end_user1.strftime("%I:%M %p"),
+                        },
+                        "partner_time": {
+                            "timezone": user_timezones.get(partner_id),
+                            "day": overlap_start_user2.strftime("%A"),
+                            "start_time": overlap_start_user2.strftime("%I:%M %p"),
+                            "end_time": overlap_end_user2.strftime("%I:%M %p"),
+                        },
+                        "duration_minutes": duration_minutes
+                    })
     
     return compatible_times

@@ -88,7 +88,7 @@ async def get_piece_tags(
         limit=limit
     )
     
-    return [Tag.model_validate(tag) for tag in tags]
+    return tags
 
 
 @router.get("/{tag_id}", response_model=Tag)

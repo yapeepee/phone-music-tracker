@@ -12,7 +12,7 @@ if settings.DATABASE_URL.startswith("postgresql+asyncpg://"):
         future=True,
         pool_size=20,
         max_overflow=40,
-        pool_pre_ping=True,
+        pool_pre_ping=False,
     )
 else:
     # For other connections, use NullPool

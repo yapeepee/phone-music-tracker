@@ -41,9 +41,9 @@ async def get_current_pieces(
             user_current_pieces.c.last_practiced_at,
             user_current_pieces.c.practice_session_count,
             user_current_pieces.c.created_at,
-            user_current_pieces.c.updated_at,
-            Tag
+            user_current_pieces.c.updated_at
         )
+        .select_from(user_current_pieces)
         .join(Tag, Tag.id == user_current_pieces.c.piece_id)
         .where(
             and_(
@@ -66,16 +66,21 @@ async def get_current_pieces(
     # Convert to response format
     current_pieces = []
     for row in rows:
+        # Get the piece details separately
+        piece_query = select(Tag).where(Tag.id == row.piece_id)
+        piece_result = await db.execute(piece_query)
+        piece = piece_result.scalar_one()
+        
         piece_data = {
             "piece_id": row.piece_id,
             "started_at": row.started_at,
             "notes": row.notes,
-            "priority": row.priority,
+            "priority": row.priority or 3,
             "last_practiced_at": row.last_practiced_at,
-            "practice_session_count": row.practice_session_count,
-            "created_at": row.created_at,
-            "updated_at": row.updated_at,
-            "piece": TagSchema.model_validate(row.Tag)
+            "practice_session_count": row.practice_session_count or 0,
+            "created_at": row.created_at or row.started_at,
+            "updated_at": row.updated_at or row.started_at,
+            "piece": TagSchema.model_validate(piece)
         }
         current_pieces.append(CurrentPieceWithDetails(**piece_data))
     

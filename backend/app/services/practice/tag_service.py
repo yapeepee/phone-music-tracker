@@ -16,6 +16,7 @@ class TagService:
     async def get_tags(
         self,
         teacher_id: Optional[UUID] = None,
+        tag_type: Optional[str] = None,
         skip: int = 0,
         limit: int = 100
     ) -> List[Tag]:
@@ -33,6 +34,10 @@ class TagService:
         else:
             # Only get global tags
             query = query.where(Tag.owner_teacher_id == None)
+        
+        # Filter by tag type if specified
+        if tag_type:
+            query = query.where(Tag.tag_type == tag_type)
         
         query = query.offset(skip).limit(limit).order_by(Tag.name)
         

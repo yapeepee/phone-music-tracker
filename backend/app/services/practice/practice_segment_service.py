@@ -289,6 +289,149 @@ class PracticeSegmentService:
         
         return dict(row)
     
+    async def get_overall_segment_analytics(
+        self,
+        student_id: UUID,
+        days: int = 30
+    ) -> dict:
+        """Get overall practice focus analytics for all segments"""
+        from datetime import timedelta
+        
+        # Calculate date range
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=days)
+        
+        # Get all segments with click data
+        segments_query = text("""
+            SELECT 
+                ps.id as segment_id,
+                ps.name as segment_name,
+                ps.description,
+                ps.is_completed,
+                ps.total_click_count,
+                ps.created_at,
+                t.name as piece_name,
+                t.composer,
+                t.is_archived as piece_archived,
+                COUNT(DISTINCT DATE(sc.created_at)) as days_practiced,
+                COUNT(sc.id) as recent_clicks,
+                MAX(sc.created_at) as last_clicked
+            FROM practice_segments ps
+            JOIN tags t ON ps.piece_tag_id = t.id
+            LEFT JOIN segment_clicks sc ON ps.id = sc.segment_id 
+                AND sc.created_at >= :start_date
+            WHERE ps.student_id = :student_id
+            GROUP BY ps.id, ps.name, ps.description, ps.is_completed, 
+                     ps.total_click_count, ps.created_at, t.name, t.composer, t.is_archived
+            ORDER BY ps.total_click_count DESC
+        """)
+        
+        result = await self.db.execute(
+            segments_query,
+            {"student_id": student_id, "start_date": start_date}
+        )
+        all_segments = result.fetchall()
+        
+        # Get daily click distribution
+        daily_clicks_query = text("""
+            SELECT 
+                DATE(sc.created_at) as practice_date,
+                COUNT(*) as click_count,
+                COUNT(DISTINCT sc.segment_id) as segments_practiced
+            FROM segment_clicks sc
+            JOIN practice_segments ps ON sc.segment_id = ps.id
+            WHERE ps.student_id = :student_id
+                AND sc.created_at >= :start_date
+            GROUP BY DATE(sc.created_at)
+            ORDER BY practice_date DESC
+        """)
+        
+        daily_result = await self.db.execute(
+            daily_clicks_query,
+            {"student_id": student_id, "start_date": start_date}
+        )
+        daily_clicks = daily_result.fetchall()
+        
+        # Get most clicked segments in period
+        top_segments = [
+            {
+                "segment_id": str(seg.segment_id),
+                "segment_name": seg.segment_name,
+                "piece_name": seg.piece_name,
+                "total_clicks": seg.total_click_count,
+                "recent_clicks": seg.recent_clicks,
+                "days_practiced": seg.days_practiced,
+                "is_completed": seg.is_completed,
+                "last_clicked": seg.last_clicked.isoformat() if seg.last_clicked else None
+            }
+            for seg in all_segments[:10]  # Top 10 most clicked
+        ]
+        
+        # Get least practiced segments (need attention)
+        needs_attention = [
+            {
+                "segment_id": str(seg.segment_id),
+                "segment_name": seg.segment_name,
+                "piece_name": seg.piece_name,
+                "total_clicks": seg.total_click_count,
+                "recent_clicks": seg.recent_clicks,
+                "days_practiced": seg.days_practiced,
+                "is_completed": seg.is_completed,
+                "created_days_ago": (end_date - seg.created_at).days
+            }
+            for seg in all_segments
+            if not seg.is_completed and seg.recent_clicks < 5 and not seg.piece_archived
+        ][:10]
+        
+        # Calculate statistics
+        total_segments = len(all_segments)
+        completed_segments = sum(1 for seg in all_segments if seg.is_completed)
+        active_segments = sum(1 for seg in all_segments if not seg.piece_archived and not seg.is_completed)
+        total_clicks_period = sum(seg.recent_clicks for seg in all_segments)
+        
+        # Get practice consistency
+        practice_days = len(daily_clicks)
+        consistency_percentage = (practice_days / days * 100) if days > 0 else 0
+        
+        return {
+            "period_days": days,
+            "statistics": {
+                "total_segments": total_segments,
+                "completed_segments": completed_segments,
+                "active_segments": active_segments,
+                "total_clicks_period": total_clicks_period,
+                "practice_days": practice_days,
+                "consistency_percentage": round(consistency_percentage, 1),
+                "avg_clicks_per_day": round(total_clicks_period / practice_days, 1) if practice_days > 0 else 0,
+                "avg_segments_per_day": round(sum(d.segments_practiced for d in daily_clicks) / practice_days, 1) if practice_days > 0 else 0
+            },
+            "top_practiced_segments": top_segments,
+            "needs_attention": needs_attention,
+            "daily_activity": [
+                {
+                    "date": d.practice_date.isoformat(),
+                    "clicks": d.click_count,
+                    "segments_practiced": d.segments_practiced
+                }
+                for d in daily_clicks
+            ],
+            "all_segments": [
+                {
+                    "segment_id": str(seg.segment_id),
+                    "segment_name": seg.segment_name,
+                    "piece_name": seg.piece_name,
+                    "composer": seg.composer,
+                    "total_clicks": seg.total_click_count,
+                    "recent_clicks": seg.recent_clicks,
+                    "days_practiced": seg.days_practiced,
+                    "is_completed": seg.is_completed,
+                    "piece_archived": seg.piece_archived,
+                    "last_clicked": seg.last_clicked.isoformat() if seg.last_clicked else None
+                }
+                for seg in all_segments
+            ]
+        }
+    
     async def archive_piece(
         self, 
         piece_id: UUID, 

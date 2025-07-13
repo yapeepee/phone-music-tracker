@@ -327,3 +327,25 @@ async def get_archived_piece_details(
         raise HTTPException(status_code=404, detail="Archived piece not found")
     
     return piece_details
+
+
+@router.get("/analytics/overview")
+async def get_practice_focus_analytics(
+    days: int = Query(30, description="Number of days to analyze"),
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user)
+) -> dict:
+    """Get overall practice focus analytics for the student"""
+    if current_user.role != "student":
+        raise HTTPException(
+            status_code=403,
+            detail="Only students can view their analytics"
+        )
+    
+    segment_service = PracticeSegmentService(db)
+    analytics = await segment_service.get_overall_segment_analytics(
+        student_id=current_user.id,
+        days=days
+    )
+    
+    return analytics

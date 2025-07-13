@@ -7,6 +7,7 @@ from app.api.v1.api import api_router
 from app.core.config import settings
 from app.db.session import engine
 from app.db.base_class import Base
+from app.core.rate_limit import setup_rate_limiting
 
 
 @asynccontextmanager
@@ -53,6 +54,9 @@ app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["localhost", "127.0.0.1", "172.26.153.150", "192.168.8.196", "*.musictracker.com"],
 )
+
+# Setup rate limiting
+setup_rate_limiting(app)
 
 # Include API router
 app.include_router(api_router, prefix=settings.API_V1_STR)

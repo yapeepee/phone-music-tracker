@@ -1,6 +1,7 @@
 """Storage service for S3/MinIO operations."""
 import os
 import logging
+import asyncio
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 import boto3
@@ -154,18 +155,24 @@ class StorageService:
         Returns:
             Existence status
         """
-        try:
-            self.s3_client.head_object(
-                Bucket=self.bucket_name,
-                Key=object_key
-            )
-            return True
-        except ClientError as e:
-            error_code = e.response["Error"]["Code"]
-            if error_code == "404":
-                return False
-            logger.error(f"Error checking file existence: {e}")
-            raise
+        # Run synchronous boto3 call in thread pool
+        loop = asyncio.get_event_loop()
+        
+        def _check_exists():
+            try:
+                self.s3_client.head_object(
+                    Bucket=self.bucket_name,
+                    Key=object_key
+                )
+                return True
+            except ClientError as e:
+                error_code = e.response["Error"]["Code"]
+                if error_code == "404":
+                    return False
+                logger.error(f"Error checking file existence: {e}")
+                raise
+        
+        return await loop.run_in_executor(None, _check_exists)
     
     async def get_file_info(self, object_key: str) -> Optional[Dict[str, Any]]:
         """
@@ -215,33 +222,40 @@ class StorageService:
         Returns:
             Presigned URL
         """
-        try:
-            if http_method == "GET":
-                url = self.s3_client.generate_presigned_url(
-                    "get_object",
-                    Params={
-                        "Bucket": self.bucket_name,
-                        "Key": object_key
-                    },
-                    ExpiresIn=expiration
-                )
-            elif http_method == "PUT":
-                url = self.s3_client.generate_presigned_url(
-                    "put_object",
-                    Params={
-                        "Bucket": self.bucket_name,
-                        "Key": object_key
-                    },
-                    ExpiresIn=expiration
-                )
-            else:
-                raise ValueError(f"Unsupported HTTP method: {http_method}")
-            
-            return url
-            
-        except ClientError as e:
-            logger.error(f"Error generating presigned URL: {e}")
-            raise
+        # Run synchronous boto3 call in thread pool to avoid blocking async context
+        loop = asyncio.get_event_loop()
+        
+        def _generate_url():
+            try:
+                if http_method == "GET":
+                    url = self.s3_client.generate_presigned_url(
+                        "get_object",
+                        Params={
+                            "Bucket": self.bucket_name,
+                            "Key": object_key
+                        },
+                        ExpiresIn=expiration
+                    )
+                elif http_method == "PUT":
+                    url = self.s3_client.generate_presigned_url(
+                        "put_object",
+                        Params={
+                            "Bucket": self.bucket_name,
+                            "Key": object_key
+                        },
+                        ExpiresIn=expiration
+                    )
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {http_method}")
+                
+                return url
+                
+            except ClientError as e:
+                logger.error(f"Error generating presigned URL: {e}")
+                raise
+        
+        # Execute sync function in thread pool
+        return await loop.run_in_executor(None, _generate_url)
     
     async def list_files(
         self,

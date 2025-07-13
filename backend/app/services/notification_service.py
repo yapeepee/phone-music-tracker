@@ -207,3 +207,79 @@ class NotificationService:
         await self.db.commit()
         
         return len(old_notifications)
+    
+    async def create_partner_request_notification(
+        self,
+        partner_id: UUID,
+        requester_name: str,
+        piece_name: str,
+        match_id: UUID,
+        message: Optional[str] = None
+    ) -> Notification:
+        """Create a notification for a new practice partner request"""
+        notification_message = f"{requester_name} wants to practice {piece_name} with you"
+        if message:
+            notification_message += f". Message: {message}"
+        
+        notification_data = NotificationCreate(
+            user_id=partner_id,
+            type=NotificationType.PARTNER_REQUEST_RECEIVED,
+            title="New Practice Partner Request",
+            message=notification_message,
+            data={
+                "match_id": str(match_id),
+                "piece_name": piece_name,
+                "requester_name": requester_name
+            }
+        )
+        
+        return await self.create_notification(notification_data)
+    
+    async def create_partner_accepted_notification(
+        self,
+        requester_id: UUID,
+        partner_name: str,
+        piece_name: str,
+        match_id: UUID,
+        message: Optional[str] = None
+    ) -> Notification:
+        """Create a notification when a partner request is accepted"""
+        notification_message = f"{partner_name} accepted your request to practice {piece_name}"
+        if message:
+            notification_message += f". Message: {message}"
+        
+        notification_data = NotificationCreate(
+            user_id=requester_id,
+            type=NotificationType.PARTNER_REQUEST_ACCEPTED,
+            title="Practice Partner Request Accepted",
+            message=notification_message,
+            data={
+                "match_id": str(match_id),
+                "piece_name": piece_name,
+                "partner_name": partner_name
+            }
+        )
+        
+        return await self.create_notification(notification_data)
+    
+    async def create_partner_declined_notification(
+        self,
+        requester_id: UUID,
+        partner_name: str,
+        piece_name: str,
+        match_id: UUID
+    ) -> Notification:
+        """Create a notification when a partner request is declined"""
+        notification_data = NotificationCreate(
+            user_id=requester_id,
+            type=NotificationType.PARTNER_REQUEST_DECLINED,
+            title="Practice Partner Request Declined",
+            message=f"{partner_name} declined your request to practice {piece_name}",
+            data={
+                "match_id": str(match_id),
+                "piece_name": piece_name,
+                "partner_name": partner_name
+            }
+        )
+        
+        return await self.create_notification(notification_data)

@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from app.models.user import User
 from app.models.reputation import ReputationHistory, REPUTATION_POINTS
+from app.core.cache import cache_get, cache_set, cache_delete, CacheKeys
 
 
 class ReputationService:
@@ -69,6 +70,14 @@ class ReputationService:
         
         try:
             await self.db.commit()
+            
+            # Invalidate user reputation cache
+            cache_key = CacheKeys.format(CacheKeys.USER_REPUTATION, user_id=str(user_id))
+            await cache_delete(cache_key)
+            
+            # Also invalidate leaderboard cache
+            await cache_delete("leaderboard:*")
+            
         except Exception:
             # Unique constraint violation means this event was already recorded
             await self.db.rollback()

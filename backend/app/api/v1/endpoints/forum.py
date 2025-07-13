@@ -1,12 +1,14 @@
 """Forum endpoints for community Q&A."""
 from typing import List, Optional
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Query, Body, Request
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.api import deps
 from app.models.user import User
-from app.models.forum import PostStatus
+from app.models.forum import PostStatus, Post as PostModel
+# from app.core.rate_limit import rate_limit  # Temporarily disabled
 from app.schemas.forum import (
     Post,
     PostCreate,
@@ -24,6 +26,120 @@ from app.services.forum.forum_service import ForumService
 from app.services.media.forum_media_service import ForumMediaService
 
 router = APIRouter()
+
+
+# Debug endpoint to test database connection
+@router.get("/test-simple/{post_id}")
+async def test_simple_post(
+    post_id: UUID,
+    db: AsyncSession = Depends(deps.get_db)
+):
+    """Test simple post retrieval without any complex logic."""
+    try:
+        # Direct query without any service or complex logic
+        result = await db.execute(
+            select(PostModel).where(PostModel.id == post_id)
+        )
+        post = result.scalar_one_or_none()
+        
+        if post:
+            return {
+                "status": "success",
+                "id": str(post.id),
+                "title": post.title,
+                "content": post.content[:100] + "..." if len(post.content) > 100 else post.content
+            }
+        else:
+            return {"status": "not_found"}
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
+        }
+
+
+# Debug endpoint to test simple post creation
+@router.post("/test-create-simple")
+async def test_create_simple(
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user)
+):
+    """Test simple post creation without any complex logic."""
+    try:
+        # Create a simple post directly
+        new_post = PostModel(
+            author_id=current_user.id,
+            title="Test Post Simple",
+            content="This is a test post created directly without services.",
+            status=PostStatus.PUBLISHED
+        )
+        db.add(new_post)
+        await db.commit()
+        await db.refresh(new_post)
+        
+        return {
+            "status": "success",
+            "id": str(new_post.id),
+            "title": new_post.title
+        }
+    except Exception as e:
+        await db.rollback()
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
+        }
+
+
+# Helper function to convert comment - moved outside to avoid nested async closure issues
+async def convert_comment_to_dict(comment, db: AsyncSession, level: int = 0):
+    """Convert a comment model to a dictionary with proper formatting."""
+    if comment.is_deleted:
+        comment_dict = {
+            'id': comment.id,
+            'post_id': comment.post_id,
+            'author_id': comment.author_id,
+            'parent_id': comment.parent_id,
+            'content': "[deleted]",
+            'is_deleted': True,
+            'vote_score': 0,
+            'created_at': comment.created_at,
+            'updated_at': comment.updated_at,
+            'author_name': "[deleted]",
+            'author_role': "unknown",
+            'author_reputation_points': 0,
+            'author_reputation_level': "newcomer",
+            'children': [],
+            'media_files': []
+        }
+    else:
+        comment_dict = {
+            'id': comment.id,
+            'post_id': comment.post_id,
+            'author_id': comment.author_id,
+            'parent_id': comment.parent_id,
+            'content': comment.content,
+            'is_deleted': comment.is_deleted,
+            'vote_score': comment.vote_score,
+            'created_at': comment.created_at,
+            'updated_at': comment.updated_at,
+            'author_name': comment.author.full_name,
+            'author_role': comment.author.role,
+            'author_reputation_points': comment.author.reputation_points,
+            'author_reputation_level': comment.author.reputation_level,
+            'children': [],
+            'media_files': []  # Temporarily disabled - await convert_media_files_to_urls(comment.media_files, db)
+        }
+    
+    # Convert children recursively
+    for child in comment.children:
+        child_dict = await convert_comment_to_dict(child, db, level + 1)
+        comment_dict['children'].append(child_dict)
+    
+    return comment_dict
+
+
 
 
 async def convert_media_files_to_urls(media_files: List, db: AsyncSession) -> List[ForumMediaWithUrl]:
@@ -46,49 +162,60 @@ async def convert_media_files_to_urls(media_files: List, db: AsyncSession) -> Li
 @router.post("/posts/", response_model=Post)
 async def create_post(
     post_data: PostCreate,
-    db: AsyncSession = Depends(deps.get_db),
-    current_user: User = Depends(deps.get_current_user)
+    current_user: User = Depends(deps.get_current_user),
+    db: AsyncSession = Depends(deps.get_db)
 ) -> Post:
     """
     Create a new forum post.
     
     Any authenticated user can create posts.
     """
+    # Test if cache disable fixes the issue
     forum_service = ForumService(db)
+    post = await forum_service.create_post(
+        author_id=current_user.id,
+        post_data=post_data
+    )
     
-    try:
-        post = await forum_service.create_post(
-            author_id=current_user.id,
-            post_data=post_data
-        )
+    # Convert to Pydantic schema with author info
+    post_dict = {
+        'id': post.id,
+        'author_id': post.author_id,
+        'title': post.title,
+        'content': post.content,
+        'tags': [tag.name for tag in post.tags],
+        'status': post.status,
+        'vote_score': post.vote_score,
+        'comment_count': post.comment_count,
+        'view_count': post.view_count,
+        'accepted_answer_id': post.accepted_answer_id,
+        'related_piece_id': post.related_piece_id,
+        'created_at': post.created_at,
+        'updated_at': post.updated_at,
+        'last_activity_at': post.last_activity_at,
+        'author_name': post.author.full_name,
+        'author_role': post.author.role,
+        'author_reputation_points': post.author.reputation_points,
+        'author_reputation_level': post.author.reputation_level,
+        'related_piece': {
+            'id': post.related_piece.id,
+            'name': post.related_piece.name,
+            'color': post.related_piece.color,
+            'tag_type': post.related_piece.tag_type,
+            'composer': post.related_piece.composer,
+            'opus_number': post.related_piece.opus_number,
+            'difficulty_level': post.related_piece.difficulty_level,
+            'owner_teacher_id': post.related_piece.owner_teacher_id,
+            'estimated_mastery_sessions': post.related_piece.estimated_mastery_sessions,
+            'is_archived': post.related_piece.is_archived,
+            'archived_at': post.related_piece.archived_at,
+            'created_at': post.related_piece.created_at,
+            'updated_at': post.related_piece.updated_at
+        } if post.related_piece else None,
+        'media_files': []  # No media files on initial creation
+    }
         
-        # Convert to Pydantic schema with author info
-        post_dict = {
-            'id': post.id,
-            'author_id': post.author_id,
-            'title': post.title,
-            'content': post.content,
-            'tags': [tag.name for tag in post.tags],
-            'status': post.status,
-            'vote_score': post.vote_score,
-            'comment_count': post.comment_count,
-            'view_count': post.view_count,
-            'accepted_answer_id': post.accepted_answer_id,
-            'related_piece_id': post.related_piece_id,
-            'created_at': post.created_at,
-            'updated_at': post.updated_at,
-            'last_activity_at': post.last_activity_at,
-            'author_name': current_user.full_name,
-            'author_role': current_user.role,
-            'author_reputation_points': current_user.reputation_points,
-            'author_reputation_level': current_user.reputation_level,
-            'related_piece': post.related_piece,
-            'media_files': []  # No media files on initial creation
-        }
-        
-        return Post(**post_dict)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    return Post(**post_dict)
 
 
 @router.get("/posts/", response_model=PostList)
@@ -144,8 +271,22 @@ async def get_posts(
             'author_role': post.author.role,
             'author_reputation_points': post.author.reputation_points,
             'author_reputation_level': post.author.reputation_level,
-            'related_piece': post.related_piece,
-            'media_files': await convert_media_files_to_urls(post.media_files, db)
+            'related_piece': {
+                'id': post.related_piece.id,
+                'name': post.related_piece.name,
+                'color': post.related_piece.color,
+                'tag_type': post.related_piece.tag_type,
+                'composer': post.related_piece.composer,
+                'opus_number': post.related_piece.opus_number,
+                'difficulty_level': post.related_piece.difficulty_level,
+                'owner_teacher_id': post.related_piece.owner_teacher_id,
+                'estimated_mastery_sessions': post.related_piece.estimated_mastery_sessions,
+                'is_archived': post.related_piece.is_archived,
+                'archived_at': post.related_piece.archived_at,
+                'created_at': post.related_piece.created_at,
+                'updated_at': post.related_piece.updated_at
+            } if post.related_piece else None,
+            'media_files': []  # Temporarily disabled - await convert_media_files_to_urls(post.media_files, db)
         }
         post_items.append(Post(**post_dict))
     
@@ -177,51 +318,6 @@ async def get_post(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     
-    # Helper function to convert comment
-    async def convert_comment(comment, level=0):
-        if comment.is_deleted:
-            comment_dict = {
-                'id': comment.id,
-                'post_id': comment.post_id,
-                'author_id': comment.author_id,
-                'parent_id': comment.parent_id,
-                'content': "[deleted]",
-                'is_deleted': True,
-                'vote_score': 0,
-                'created_at': comment.created_at,
-                'updated_at': comment.updated_at,
-                'author_name': "[deleted]",
-                'author_role': "unknown",
-                'author_reputation_points': 0,
-                'author_reputation_level': "newcomer",
-                'children': [],
-                'media_files': []
-            }
-        else:
-            comment_dict = {
-                'id': comment.id,
-                'post_id': comment.post_id,
-                'author_id': comment.author_id,
-                'parent_id': comment.parent_id,
-                'content': comment.content,
-                'is_deleted': comment.is_deleted,
-                'vote_score': comment.vote_score,
-                'created_at': comment.created_at,
-                'updated_at': comment.updated_at,
-                'author_name': comment.author.full_name,
-                'author_role': comment.author.role,
-                'author_reputation_points': comment.author.reputation_points,
-                'author_reputation_level': comment.author.reputation_level,
-                'children': [],
-                'media_files': await convert_media_files_to_urls(comment.media_files, db)
-            }
-        
-        # Convert children recursively
-        for child in comment.children:
-            child_dict = await convert_comment(child, level+1)
-            comment_dict['children'].append(child_dict)
-        
-        return comment_dict
     
     # Convert to Pydantic schema
     post_dict = {
@@ -243,14 +339,28 @@ async def get_post(
         'author_role': post.author.role,
         'author_reputation_points': post.author.reputation_points,
         'author_reputation_level': post.author.reputation_level,
-        'related_piece': post.related_piece,
-        'media_files': await convert_media_files_to_urls(post.media_files, db),
+        'related_piece': {
+            'id': post.related_piece.id,
+            'name': post.related_piece.name,
+            'color': post.related_piece.color,
+            'tag_type': post.related_piece.tag_type,
+            'composer': post.related_piece.composer,
+            'opus_number': post.related_piece.opus_number,
+            'difficulty_level': post.related_piece.difficulty_level,
+            'owner_teacher_id': post.related_piece.owner_teacher_id,
+            'estimated_mastery_sessions': post.related_piece.estimated_mastery_sessions,
+            'is_archived': post.related_piece.is_archived,
+            'archived_at': post.related_piece.archived_at,
+            'created_at': post.related_piece.created_at,
+            'updated_at': post.related_piece.updated_at
+        } if post.related_piece else None,
+        'media_files': [],  # Temporarily disabled - await convert_media_files_to_urls(post.media_files, db),
         'comments': []
     }
     
     # Convert comments
     for comment in post.comments:
-        comment_dict = await convert_comment(comment)
+        comment_dict = await convert_comment_to_dict(comment, db)
         post_dict['comments'].append(comment_dict)
     
     return PostWithComments(**post_dict)
@@ -302,7 +412,21 @@ async def update_post(
         'author_role': current_user.role,
         'author_reputation_points': current_user.reputation_points,
         'author_reputation_level': current_user.reputation_level,
-        'related_piece': post.related_piece,
+        'related_piece': {
+            'id': post.related_piece.id,
+            'name': post.related_piece.name,
+            'color': post.related_piece.color,
+            'tag_type': post.related_piece.tag_type,
+            'composer': post.related_piece.composer,
+            'opus_number': post.related_piece.opus_number,
+            'difficulty_level': post.related_piece.difficulty_level,
+            'owner_teacher_id': post.related_piece.owner_teacher_id,
+            'estimated_mastery_sessions': post.related_piece.estimated_mastery_sessions,
+            'is_archived': post.related_piece.is_archived,
+            'archived_at': post.related_piece.archived_at,
+            'created_at': post.related_piece.created_at,
+            'updated_at': post.related_piece.updated_at
+        } if post.related_piece else None,
         'media_files': await convert_media_files_to_urls(post.media_files, db)
     }
     
@@ -490,10 +614,12 @@ async def delete_comment(
 # Voting endpoints
 @router.post("/posts/{post_id}/vote", response_model=VoteResponse)
 async def vote_post(
+    request: Request,
     post_id: UUID,
     vote_data: VoteCreate,
     db: AsyncSession = Depends(deps.get_db),
-    current_user: User = Depends(deps.get_current_user)
+    current_user: User = Depends(deps.get_current_user),
+    _: bool = Depends(deps.rate_limit_vote)
 ) -> VoteResponse:
     """
     Vote on a post.

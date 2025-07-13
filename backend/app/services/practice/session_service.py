@@ -33,6 +33,8 @@ class SessionService:
             end_time=session_data.end_time,
             self_rating=session_data.self_rating,
             note=session_data.note,
+            target_tempo=session_data.target_tempo,
+            practice_mode=session_data.practice_mode,
             is_synced=True,  # Created via API, so it's synced
         )
         
@@ -249,14 +251,25 @@ class SessionService:
         """Get existing tags or create new ones"""
         tags = []
         for name in tag_names:
-            # Check if tag exists
-            query = select(Tag).where(Tag.name == name)
+            # Check if tag exists - prefer general tags first, then any tag
+            # This handles cases where there might be multiple tags with same name
+            query = select(Tag).where(Tag.name == name).order_by(
+                # Prioritize general tags, then technique, then piece
+                case(
+                    (Tag.tag_type == "general", 1),
+                    (Tag.tag_type == "technique", 2),
+                    (Tag.tag_type == "piece", 3),
+                    else_=4
+                ),
+                Tag.created_at  # Then by creation date
+            ).limit(1)
+            
             result = await self.db.execute(query)
             tag = result.scalar_one_or_none()
             
             if not tag:
-                # Create new tag
-                tag = Tag(name=name)
+                # Create new tag as general type by default
+                tag = Tag(name=name, tag_type="general")
                 self.db.add(tag)
             
             tags.append(tag)
