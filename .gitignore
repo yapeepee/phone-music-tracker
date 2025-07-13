@@ -234,16 +234,13 @@ local_scripts/
 *.prof
 *.lprof
 
-# Keep important documentation
+# Documentation - ignore all MD files except user guides
+*.md
 !README.md
-!DOCUMENTATION_INDEX.md
-!PROJECT_PLAN.md
-
-# Analysis documents (keep local only)
-MUSIC_TRACKER_INTERVIEW_ANALYSIS.md
-COMPREHENSIVE_PROJECT_ANALYSIS.md
-*_ANALYSIS.md
-*分析*.md
+!GETTING_STARTED.md
+!USER_GUIDE.md
+!INSTALLATION.md
+!USAGE.md
 
 # TypeScript
 *.tsbuildinfo
